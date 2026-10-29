@@ -1,0 +1,53 @@
+# Builds brandix-sticky.zip and publishes a GitHub Release whenever the Version in sticky.php changes.
+# WordPress sites running Brandix Kit read the latest release and show it as a normal plugin update.
+name: Release plugin
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read version from plugin header
+        id: v
+        run: |
+          VER=$(grep -m1 -oP '^\s*\*\s*Version:\s*\K[0-9.]+' sticky.php)
+          echo "version=$VER" >> "$GITHUB_OUTPUT"
+          echo "Plugin version: $VER"
+
+      - name: Skip if this version is already released
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "v${{ steps.v.outputs.version }}" >/dev/null 2>&1; then
+            echo "exists=1" >> "$GITHUB_OUTPUT"
+            echo "v${{ steps.v.outputs.version }} already released - bump Version in sticky.php to publish an update."
+          else
+            echo "exists=0" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build zip (top folder must be brandix-sticky)
+        if: steps.check.outputs.exists == '0'
+        run: |
+          mkdir -p build/brandix-sticky
+          rsync -a --exclude '.git' --exclude '.github' --exclude 'build' --exclude 'README.md' --exclude '.gitignore' ./ build/brandix-sticky/
+          cd build && zip -qr brandix-sticky.zip brandix-sticky
+
+      - name: Publish release
+        if: steps.check.outputs.exists == '0'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NOTES: ${{ github.event.head_commit.message }}
+        run: |
+          gh release create "v${{ steps.v.outputs.version }}" build/brandix-sticky.zip \
+            --title "v${{ steps.v.outputs.version }}" \
+            --notes "${NOTES:-Release v${{ steps.v.outputs.version }}}"
