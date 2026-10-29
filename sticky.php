@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Brandix PowerKit - Enterprise Agency Engine
  * Description: All-in-one professional agency utility: URL redirects & 404 log, cookie consent (Consent Mode v2), image optimizer, Sticky action buttons with detached labels, high-performance duplicator, 301 redirection manager with hit tracking, SEO alt tags, maintenance mode, advanced malware security lockdown, global email outcome logging, Google and Microsoft OAuth APIs, SMTP2GO API, Other SMTP, and multiple dynamic search & replace engine.
- * Version: 1.0
+ * Version: 11.30
  * Update URI: https://github.com
  * Requires at least: 5.9
  * Requires PHP: 7.4
@@ -16,7 +16,7 @@ if (!defined('ABSPATH')) exit;
  * 1. Database Initialization & Schema Setup
  * Runs only on activation/version upgrade, not on every frontend request.
  */
-define('BX_POWERKIT_DB_VERSION', '1.0');
+define('BX_POWERKIT_DB_VERSION', '11.30');
 define('BX_POWERKIT_FILE', __FILE__);
 
 // Feature modules (each one checks its own on/off switch).
