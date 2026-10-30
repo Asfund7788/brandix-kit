@@ -14,6 +14,7 @@
  * - Optional anonymous consent log (no IP stored).
  */
 if (!defined('ABSPATH')) exit;
+// phpcs:disable WordPress.DB.DirectDatabaseQuery -- the plugin keeps its logs and redirects in its own custom tables; there is no WordPress API for them and results must be live, so they are queried directly.
 
 function bx_cc_defaults() {
     return [
@@ -55,7 +56,7 @@ function bx_cc_enabled() {
 function bx_cc_should_run() {
     if (!bx_cc_enabled() || is_admin() || wp_doing_ajax() || wp_doing_cron()) return false;
     if ((defined('REST_REQUEST') && REST_REQUEST) || is_feed() || is_customize_preview()) return false;
-    if (isset($_GET['elementor-preview'])) return false;
+    if (isset($_GET['elementor-preview'])) return false; // phpcs:ignore WordPress.Security.NonceVerification.Recommended -- only detects the Elementor preview.
     if (class_exists('\Elementor\Plugin') && isset(\Elementor\Plugin::$instance->preview) && \Elementor\Plugin::$instance->preview->is_preview_mode()) return false;
     return true;
 }
@@ -359,11 +360,13 @@ add_shortcode('bx_cookie_settings', function ($atts) {
  * ------------------------------------------------------------------------- */
 function bx_cc_log_handler() {
     if (!bx_cc_enabled() || empty(bx_cc_options()['log_consent'])) wp_die('', '', ['response' => 204]);
+    // Public endpoint for visitors: no nonce (it would break on cached pages); rate-limited and stores no personal data.
+    // phpcs:disable WordPress.Security.NonceVerification.Missing
     $id = sanitize_text_field(wp_unslash($_POST['id'] ?? ''));
     if (!preg_match('/^[a-f0-9]{16,40}$/', $id)) wp_die('', '', ['response' => 400]);
 
     // Basic abuse protection: max 20 log entries per visitor IP per hour (IP is hashed, never stored).
-    $key = 'bx_cc_rl_' . md5(($_SERVER['REMOTE_ADDR'] ?? '') . wp_salt('nonce'));
+    $key = 'bx_cc_rl_' . md5(bx_client_ip() . wp_salt('nonce'));
     $n = (int) get_transient($key);
     if ($n >= 20) wp_die('', '', ['response' => 429]);
     set_transient($key, $n + 1, HOUR_IN_SECONDS);
@@ -377,6 +380,7 @@ function bx_cc_log_handler() {
         'page'       => substr(sanitize_text_field(wp_unslash($_POST['u'] ?? '')), 0, 255),
         'created_at' => current_time('mysql'),
     ], ['%s', '%d', '%d', '%d', '%s', '%s']);
+    // phpcs:enable WordPress.Security.NonceVerification.Missing
     wp_die('', '', ['response' => 204]);
 }
 add_action('wp_ajax_bx_cc_log', 'bx_cc_log_handler');
@@ -422,9 +426,9 @@ function bx_cc_admin_page() {
     $o = bx_cc_options();
     global $wpdb;
     $t = $wpdb->prefix . 'bx_consent_log';
-    $since = date('Y-m-d H:i:s', current_time('timestamp') - 30 * DAY_IN_SECONDS);
+    $since = gmdate('Y-m-d H:i:s', current_time('timestamp') - 30 * DAY_IN_SECONDS);
     $stats = $wpdb->get_row($wpdb->prepare(
-        "SELECT COUNT(*) total, SUM(analytics=1 AND marketing=1) all_on, SUM(analytics=0 AND marketing=0) all_off FROM {$t} WHERE created_at >= %s", $since
+        "SELECT COUNT(*) total, SUM(analytics=1 AND marketing=1) all_on, SUM(analytics=0 AND marketing=0) all_off FROM %i WHERE created_at >= %s", $t, $since
     ), ARRAY_A);
     $field = function ($k, $label, $type = 'text') use ($o) {
         $id = 'bx-cc-' . $k;
@@ -506,7 +510,7 @@ function bx_cc_admin_page() {
                 Rejected all: <strong><?php echo esc_html(round(100 * $stats['all_off'] / $total)); ?>%</strong> ·
                 Custom: <strong><?php echo esc_html(100 - round(100 * $stats['all_on'] / $total) - round(100 * $stats['all_off'] / $total)); ?>%</strong>
             <?php endif; ?></p>
-            <?php $rows = $wpdb->get_results("SELECT * FROM {$t} ORDER BY id DESC LIMIT 50", ARRAY_A); ?>
+            <?php $rows = $wpdb->get_results($wpdb->prepare("SELECT * FROM %i ORDER BY id DESC LIMIT 50", $t), ARRAY_A); ?>
             <?php bx_log_bulk_form_open('consent'); ?>
             <p style="display:flex;gap:8px;">
                 <?php bx_log_bulk_button(); ?>

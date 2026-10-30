@@ -74,7 +74,7 @@ add_filter('pre_set_site_transient_update_plugins', function ($transient) {
         'package'     => $rel['zip'],
         'icons'       => [],
         'banners'     => [],
-        'requires'    => '5.9',
+        'requires'    => '6.2',
         'requires_php'=> '7.4',
     ];
     $current = $transient->checked[$base] ?? BX_POWERKIT_DB_VERSION;
@@ -101,7 +101,7 @@ add_filter('plugins_api', function ($result, $action, $args) {
         'author'        => 'Brandix Soft',
         'homepage'      => $rel['url'],
         'download_link' => $rel['zip'],
-        'requires'      => '5.9',
+        'requires'      => '6.2',
         'requires_php'  => '7.4',
         'last_updated'  => $rel['date'],
         'sections'      => ['changelog' => '<h4>' . esc_html($rel['version']) . '</h4><p>' . $notes . '</p>'],

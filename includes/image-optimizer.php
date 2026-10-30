@@ -28,6 +28,16 @@ function bx_img_webp_supported() {
     return function_exists('wp_image_editor_supports') && wp_image_editor_supports(['mime_type' => 'image/webp']);
 }
 
+/** Replace $dest with $src using the WordPress filesystem API. */
+function bx_img_move($src, $dest) {
+    global $wp_filesystem;
+    if (!$wp_filesystem) {
+        require_once ABSPATH . 'wp-admin/includes/file.php';
+        WP_Filesystem();
+    }
+    return $wp_filesystem && $wp_filesystem->move($src, $dest, true);
+}
+
 add_filter('wp_handle_upload', 'bx_img_optimize_upload', 20, 2);
 function bx_img_optimize_upload($upload, $context = 'upload') {
     $s = bx_img_settings();
@@ -36,7 +46,7 @@ function bx_img_optimize_upload($upload, $context = 'upload') {
     $type = $upload['type'] ?? '';
     if (!in_array($type, ['image/jpeg', 'image/png', 'image/webp'], true)) return $upload;
     $file = $upload['file'];
-    if (!is_file($file) || !is_writable(dirname($file))) return $upload;
+    if (!is_file($file) || !wp_is_writable(dirname($file))) return $upload;
 
     require_once ABSPATH . 'wp-admin/includes/image.php';
     $editor = wp_get_image_editor($file);
@@ -73,17 +83,17 @@ function bx_img_optimize_upload($upload, $context = 'upload') {
     $after = (int) filesize($saved['path']);
     if (!$resized && $after >= $before) {
         // Already well compressed: keep the original untouched.
-        @unlink($saved['path']);
+        wp_delete_file($saved['path']);
         return $upload;
     }
 
     if ($to_webp) {
-        @unlink($file);
+        wp_delete_file($file);
         $upload['file'] = $saved['path'];
         $upload['url']  = trailingslashit(dirname($upload['url'])) . wp_basename($saved['path']);
         $upload['type'] = 'image/webp';
     } else {
-        if (!@rename($saved['path'], $file)) { @unlink($saved['path']); return $upload; }
+        if (!bx_img_move($saved['path'], $file)) { wp_delete_file($saved['path']); return $upload; }
     }
 
     // Running totals for the dashboard.

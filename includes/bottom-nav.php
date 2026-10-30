@@ -258,7 +258,7 @@ function bx_bnav_is_active($url) {
     $home = wp_parse_url(home_url('/'));
     if (!empty($p['host']) && !empty($home['host']) && strtolower($p['host']) !== strtolower($home['host'])) return false;
     $item_path = trailingslashit(strtolower($p['path'] ?? '/'));
-    $cur_path  = trailingslashit(strtolower((string) wp_parse_url($_SERVER['REQUEST_URI'] ?? '/', PHP_URL_PATH)));
+    $cur_path  = trailingslashit(strtolower((string) wp_parse_url(bx_request_uri() ?: '/', PHP_URL_PATH)));
     return $item_path === $cur_path;
 }
 
@@ -309,7 +309,7 @@ add_action('wp_footer', function () {
     $s = bx_bnav_options();
 
     // Hide on chosen URLs (one per line, "*" at the end = whole folder).
-    $cur = strtolower(untrailingslashit((string) wp_parse_url($_SERVER['REQUEST_URI'] ?? '/', PHP_URL_PATH))) ?: '/';
+    $cur = strtolower(untrailingslashit((string) wp_parse_url(bx_request_uri() ?: '/', PHP_URL_PATH))) ?: '/';
     foreach (preg_split('/\r\n|\r|\n/', (string) $s['hide_urls']) as $rule) {
         $rule = strtolower(trim($rule));
         if ($rule === '') continue;
@@ -325,14 +325,14 @@ add_action('wp_footer', function () {
     $H = (int) $s['height'];
     $reserve = $H + ($s['layout'] === 'floating' ? 24 : 0) + ($s['center_style'] !== 'inline' ? 10 : 0);
 
-    echo bx_bnav_render($s, 'bx-bnav');
+    echo bx_bnav_render($s, 'bx-bnav'); // phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped -- markup is escaped inside bx_bnav_render().
     ?>
     <style>
-        @media (min-width:<?php echo $bp + 1; ?>px){#bx-bnav{display:none!important}}
-        @media (max-width:<?php echo $bp; ?>px){
-            <?php if (!empty($s['body_space'])): ?>body{padding-bottom:<?php echo $reserve; ?>px}<?php endif; ?>
+        @media (min-width:<?php echo (int) ($bp + 1); ?>px){#bx-bnav{display:none!important}}
+        @media (max-width:<?php echo (int) $bp; ?>px){
+            <?php if (!empty($s['body_space'])): ?>body{padding-bottom:<?php echo (int) $reserve; ?>px}<?php endif; ?>
             /* Keep Brandix sticky buttons above the menu */
-            #bx-sticky{bottom:<?php echo $reserve + 16; ?>px!important}
+            #bx-sticky{bottom:<?php echo (int) ($reserve + 16); ?>px!important}
         }
     </style>
     <?php if ($s['scroll'] !== 'always'): ?>
@@ -426,7 +426,7 @@ function bx_bnav_admin_page() {
             <div class="bxn-card">
                 <h2>Current menu (saved)</h2>
                 <p class="bxn-help">Save to refresh this preview.</p>
-                <div class="bxn-phone"><p>Your page content…</p><?php echo bx_bnav_render($s, 'bxn-live', true, 0); ?></div>
+                <div class="bxn-phone"><p>Your page content…</p><?php echo bx_bnav_render($s, 'bxn-live', true, 0); // phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped -- escaped inside bx_bnav_render(). ?></div>
             </div>
 
             <div class="bxn-card">
@@ -436,7 +436,7 @@ function bx_bnav_admin_page() {
                     <?php foreach ($presets as $key => $p):
                         $ps = array_merge($s, $p); unset($ps['name']); ?>
                         <button type="button" class="bxn-preset <?php echo $s['preset'] === $key ? 'is-on' : ''; ?>" data-preset="<?php echo esc_attr($key); ?>" data-values="<?php echo esc_attr(wp_json_encode(array_diff_key($p, ['name' => 1]))); ?>">
-                            <div class="bxn-stage"><?php echo bx_bnav_render($ps, 'bxn-p-' . $key, true, 0); ?></div>
+                            <div class="bxn-stage"><?php echo bx_bnav_render($ps, 'bxn-p-' . $key, true, 0); // phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped -- escaped inside bx_bnav_render(). ?></div>
                             <strong><?php echo esc_html($p['name']); ?></strong>
                         </button>
                     <?php endforeach; ?>
@@ -462,7 +462,7 @@ function bx_bnav_admin_page() {
                                 </select>
                             </td>
                             <td style="white-space:nowrap">
-                                <span class="bxn-iconprev"><?php echo bx_bnav_item_icon($it); ?></span>
+                                <span class="bxn-iconprev"><?php echo bx_bnav_item_icon($it); // phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped -- SVG from the plugin icon list or an esc_url() image. ?></span>
                                 <select name="<?php echo esc_attr($n); ?>[icon]" class="bxn-icon-pick">
                                     <?php foreach ($icons as $k => $v): ?><option value="<?php echo esc_attr($k); ?>" <?php selected($it['icon'], $k); ?>><?php echo esc_html($v[0]); ?></option><?php endforeach; ?>
                                 </select>

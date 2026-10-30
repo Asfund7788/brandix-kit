@@ -5,12 +5,13 @@
  * Removes plugin tables, options, OAuth tokens, redirect meta, cron and the uploads .htaccess rule.
  */
 if (!defined('WP_UNINSTALL_PLUGIN')) exit;
+// phpcs:disable WordPress.DB.DirectDatabaseQuery -- the plugin keeps its logs and redirects in its own custom tables; there is no WordPress API for them and results must be live, so they are dropped directly.
 
 function bx_powerkit_uninstall_site() {
     global $wpdb;
 
     foreach (['bx_email_logs', 'bx_user_activity', 'bx_audit_activity', 'bx_redirects', 'bx_404_log', 'bx_consent_log'] as $t) {
-        $wpdb->query("DROP TABLE IF EXISTS {$wpdb->prefix}{$t}");
+        $wpdb->query($wpdb->prepare("DROP TABLE IF EXISTS %i", $wpdb->prefix . $t)); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.SchemaChange -- removing our own tables on uninstall.
     }
 
     foreach (['sb_options', 'bx_powerkit_db_version', 'bx_mail_tokens_google', 'bx_mail_tokens_outlook',
@@ -33,7 +34,7 @@ function bx_powerkit_uninstall_site() {
             $content = (string) @file_get_contents($path);
             $content = preg_replace('/\n?# BEGIN Brandix PowerKit.*?# END Brandix PowerKit\n?/s', "\n", $content);
             $content = trim($content);
-            if ($content === '') @unlink($path);
+            if ($content === '') wp_delete_file($path);
             else @file_put_contents($path, $content . "\n", LOCK_EX);
         }
     }

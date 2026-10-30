@@ -13,6 +13,8 @@
  * cached option read, not a table scan.
  */
 if (!defined('ABSPATH')) exit;
+// phpcs:disable WordPress.DB.DirectDatabaseQuery -- the plugin keeps its logs and redirects in its own custom tables; there is no WordPress API for them and results must be live, so they are queried directly.
+// phpcs:disable WordPress.Security.NonceVerification -- every admin_post handler calls bx_redir_guard() (capability + check_admin_referer); GET values on the admin screen are display-only (tab, search, notices).
 
 function bx_redir_enabled() {
     return !empty(get_option('sb_options', [])['enable_url_redirects']);
@@ -65,7 +67,7 @@ function bx_redir_rules() {
 
 function bx_redir_rebuild_cache() {
     global $wpdb;
-    $rows = $wpdb->get_results("SELECT id, source, target, code FROM " . bx_redir_table() . " WHERE enabled = 1", ARRAY_A);
+    $rows = $wpdb->get_results($wpdb->prepare("SELECT id, source, target, code FROM %i WHERE enabled = 1", bx_redir_table()), ARRAY_A);
     $compiled = ['exact' => [], 'wild' => []];
     foreach ((array) $rows as $r) {
         $item = ['id' => (int) $r['id'], 't' => (string) $r['target'], 'c' => (int) $r['code'], 's' => (string) $r['source']];
@@ -88,10 +90,10 @@ function bx_redir_rebuild_cache() {
 add_action('template_redirect', 'bx_redir_handle_request', 0);
 function bx_redir_handle_request() {
     if (!bx_redir_enabled() || is_admin()) return;
-    $method = strtoupper($_SERVER['REQUEST_METHOD'] ?? 'GET');
+    $method = bx_request_method();
     if (!in_array($method, ['GET', 'HEAD'], true)) return;
 
-    $uri  = wp_unslash($_SERVER['REQUEST_URI'] ?? '/');
+    $uri  = bx_request_uri() ?: '/';
     $full = bx_redir_normalize($uri);
     $path = explode('?', $full, 2)[0];
     $rules = bx_redir_rules();
@@ -114,7 +116,7 @@ function bx_redir_handle_request() {
     if (!$match) return;
 
     global $wpdb;
-    $wpdb->query($wpdb->prepare("UPDATE " . bx_redir_table() . " SET hits = hits + 1, last_hit = %s WHERE id = %d", current_time('mysql'), $match['id']));
+    $wpdb->query($wpdb->prepare("UPDATE %i SET hits = hits + 1, last_hit = %s WHERE id = %d", bx_redir_table(), current_time('mysql'), $match['id']));
 
     if ($match['c'] === 410) {
         // Tell search engines the page is gone for good; render the theme's 404 template.
@@ -145,7 +147,7 @@ function bx_redir_handle_request() {
         if ($t_norm === $path) return;
     }
 
-    wp_redirect(esc_url_raw($target), $match['c'], 'Brandix PowerKit');
+    wp_redirect(esc_url_raw($target), $match['c'], 'Brandix PowerKit'); // phpcs:ignore WordPress.Security.SafeRedirect.wp_redirect_wp_redirect -- admin-defined target may be on another domain.
     exit;
 }
 
@@ -159,9 +161,9 @@ add_action('template_redirect', 'bx_404_to_home', 100);
 function bx_404_to_home() {
     if (empty(get_option('sb_options', [])['redirect_404_home'])) return;
     if (is_admin() || !is_404() || !empty($GLOBALS['bx_redir_gone'])) return;
-    if (!in_array(strtoupper($_SERVER['REQUEST_METHOD'] ?? 'GET'), ['GET', 'HEAD'], true)) return;
+    if (!in_array(bx_request_method(), ['GET', 'HEAD'], true)) return;
 
-    $path = strtolower((string) wp_parse_url(wp_unslash($_SERVER['REQUEST_URI'] ?? ''), PHP_URL_PATH));
+    $path = strtolower((string) wp_parse_url(bx_request_uri(), PHP_URL_PATH));
 
     // Missing files (images, CSS, JS, fonts, PDFs...) keep a real 404; old .html pages are still redirected.
     if (preg_match('~\.[a-z0-9]{2,5}$~', $path) && !preg_match('~\.html?$~', $path)) return;
@@ -180,7 +182,7 @@ function bx_404_log_request() {
     if (!bx_redir_enabled() || !is_404() || !empty($GLOBALS['bx_redir_gone'])) return;
     if (empty(get_option('sb_options', [])['log_404'])) return;
 
-    $uri  = substr(wp_unslash($_SERVER['REQUEST_URI'] ?? ''), 0, 1000);
+    $uri  = substr(bx_request_uri(), 0, 1000);
     $path = explode('?', bx_redir_normalize($uri), 2)[0];
     if ($path === '' || strlen($path) > 255) return;
 
@@ -192,11 +194,11 @@ function bx_404_log_request() {
     $ref = substr(esc_url_raw(wp_unslash($_SERVER['HTTP_REFERER'] ?? '')), 0, 500);
     $now = current_time('mysql');
     $wpdb->query($wpdb->prepare(
-        "INSERT INTO " . bx_404_table() . " (url, url_hash, hits, last_referrer, first_seen, last_seen)
+        "INSERT INTO %i (url, url_hash, hits, last_referrer, first_seen, last_seen)
          VALUES (%s, %s, 1, %s, %s, %s)
          ON DUPLICATE KEY UPDATE hits = hits + 1, last_seen = VALUES(last_seen),
          last_referrer = IF(VALUES(last_referrer) <> '', VALUES(last_referrer), last_referrer)",
-        $path, md5($path), $ref, $now, $now
+        bx_404_table(), $path, md5($path), $ref, $now, $now
     ));
 }
 
@@ -246,7 +248,7 @@ function bx_redir_validate($source, $target, $code) {
 function bx_redir_upsert($rule) {
     global $wpdb;
     $hash = md5($rule['source']);
-    $existing = $wpdb->get_var($wpdb->prepare("SELECT id FROM " . bx_redir_table() . " WHERE source_hash = %s", $hash));
+    $existing = $wpdb->get_var($wpdb->prepare("SELECT id FROM %i WHERE source_hash = %s", bx_redir_table(), $hash));
     if ($existing) {
         $wpdb->update(bx_redir_table(), ['target' => $rule['target'], 'code' => $rule['code'], 'enabled' => 1], ['id' => (int) $existing], ['%s', '%d', '%d'], ['%d']);
         return 'updated';
@@ -274,7 +276,8 @@ function bx_redir_guard($nonce_action) {
 
 add_action('admin_post_bx_redir_add', function () {
     bx_redir_guard('bx_redir_add');
-    $rule = bx_redir_validate(wp_unslash($_POST['source'] ?? ''), wp_unslash($_POST['target'] ?? ''), $_POST['code'] ?? 301);
+    // phpcs:ignore WordPress.Security.ValidatedSanitizedInput.InputNotSanitized -- validated and sanitised in bx_redir_validate().
+    $rule = bx_redir_validate(wp_unslash($_POST['source'] ?? ''), wp_unslash($_POST['target'] ?? ''), absint($_POST['code'] ?? 301));
     if (is_wp_error($rule)) bx_redir_back(['bx_msg' => rawurlencode($rule->get_error_message()), 'bx_err' => 1]);
     $result = bx_redir_upsert($rule);
     bx_redir_rebuild_cache();
@@ -283,6 +286,7 @@ add_action('admin_post_bx_redir_add', function () {
 
 add_action('admin_post_bx_redir_bulk', function () {
     bx_redir_guard('bx_redir_bulk');
+    // phpcs:ignore WordPress.Security.ValidatedSanitizedInput.InputNotSanitized -- each line is validated in bx_redir_validate().
     $lines = preg_split('/\r\n|\r|\n/', (string) wp_unslash($_POST['bulk'] ?? ''));
     $added = $updated = 0;
     $errors = [];
@@ -307,7 +311,7 @@ add_action('admin_post_bx_redir_toggle', function () {
     $id = absint($_GET['id'] ?? 0);
     bx_redir_guard('bx_redir_toggle_' . $id);
     global $wpdb;
-    $wpdb->query($wpdb->prepare("UPDATE " . bx_redir_table() . " SET enabled = 1 - enabled WHERE id = %d", $id));
+    $wpdb->query($wpdb->prepare("UPDATE %i SET enabled = 1 - enabled WHERE id = %d", bx_redir_table(), $id));
     bx_redir_rebuild_cache();
     bx_redir_back();
 });
@@ -332,7 +336,7 @@ add_action('admin_post_bx_404_delete', function () {
 add_action('admin_post_bx_404_clear', function () {
     bx_redir_guard('bx_404_clear');
     global $wpdb;
-    $wpdb->query("TRUNCATE TABLE " . bx_404_table());
+    $wpdb->query($wpdb->prepare("TRUNCATE TABLE %i", bx_404_table()));
     bx_redir_back(['tab' => '404', 'bx_msg' => rawurlencode('404 log cleared.')]);
 });
 
@@ -349,7 +353,7 @@ function bx_redir_admin_page() {
     global $wpdb;
     $log_on  = !empty(get_option('sb_options', [])['log_404']);
     // 404 tab is shown only while "Log 404 errors" is on.
-    $tab = ($log_on && ($_GET['tab'] ?? '') === '404') ? '404' : 'rules';
+    $tab = ($log_on && sanitize_key(wp_unslash($_GET['tab'] ?? '')) === '404') ? '404' : 'rules';
     $base = admin_url('admin.php?page=brandix-url-redirects');
     $prefill = isset($_GET['prefill']) ? sanitize_text_field(wp_unslash($_GET['prefill'])) : '';
     $enabled = bx_redir_enabled();
@@ -369,14 +373,14 @@ function bx_redir_admin_page() {
             <div class="notice notice-warning"><p>The URL Redirects module is <strong>off</strong>. Turn it on in <a href="<?php echo esc_url(admin_url('admin.php?page=brandix-powerkit')); ?>">Brandix Kit → Master Utility Modules</a>. Rules can still be prepared here.</p></div>
         <?php endif; ?>
         <?php if (!empty($_GET['bx_msg'])): ?>
-            <div class="notice <?php echo !empty($_GET['bx_err']) ? 'notice-error' : 'notice-success'; ?> is-dismissible"><p><?php echo esc_html(wp_unslash($_GET['bx_msg'])); ?></p></div>
+            <div class="notice <?php echo !empty($_GET['bx_err']) ? 'notice-error' : 'notice-success'; ?> is-dismissible"><p><?php echo esc_html(sanitize_text_field(wp_unslash($_GET['bx_msg']))); ?></p></div>
         <?php endif; ?>
 
         <h2 class="nav-tab-wrapper">
             <a href="<?php echo esc_url($base); ?>" class="nav-tab <?php echo $tab === 'rules' ? 'nav-tab-active' : ''; ?>">Redirect Rules</a>
             <?php if ($log_on): ?>
             <a href="<?php echo esc_url(add_query_arg('tab', '404', $base)); ?>" class="nav-tab <?php echo $tab === '404' ? 'nav-tab-active' : ''; ?>">404 Log<?php
-                $c404 = (int) $wpdb->get_var("SELECT COUNT(*) FROM " . bx_404_table());
+                $c404 = (int) $wpdb->get_var($wpdb->prepare("SELECT COUNT(*) FROM %i", bx_404_table()));
                 if ($c404) echo ' <span class="awaiting-mod">' . esc_html($c404) . '</span>';
             ?></a>
             <?php endif; ?>
@@ -416,9 +420,9 @@ function bx_redir_admin_page() {
             $s = isset($_GET['s']) ? sanitize_text_field(wp_unslash($_GET['s'])) : '';
             if ($s !== '') {
                 $like = '%' . $wpdb->esc_like($s) . '%';
-                $rules = $wpdb->get_results($wpdb->prepare("SELECT * FROM " . bx_redir_table() . " WHERE source LIKE %s OR target LIKE %s ORDER BY id DESC LIMIT 500", $like, $like), ARRAY_A);
+                $rules = $wpdb->get_results($wpdb->prepare("SELECT * FROM %i WHERE source LIKE %s OR target LIKE %s ORDER BY id DESC LIMIT 500", bx_redir_table(), $like, $like), ARRAY_A);
             } else {
-                $rules = $wpdb->get_results("SELECT * FROM " . bx_redir_table() . " ORDER BY id DESC LIMIT 500", ARRAY_A);
+                $rules = $wpdb->get_results($wpdb->prepare("SELECT * FROM %i ORDER BY id DESC LIMIT 500", bx_redir_table()), ARRAY_A);
             }
             ?>
             <form method="get" style="margin:10px 0;display:flex;gap:8px">
@@ -457,7 +461,7 @@ function bx_redir_admin_page() {
                     <?php if (!$log_on): ?><br><strong>404 logging is off</strong> — turn on "Log 404 errors" in Brandix Kit → Master Utility Modules.<?php endif; ?></p>
                 <a class="button" href="<?php echo esc_url(wp_nonce_url(admin_url('admin-post.php?action=bx_404_clear'), 'bx_404_clear')); ?>" onclick="return confirm('Clear the whole 404 log?');">Clear All</a>
             </div>
-            <?php $rows = $wpdb->get_results("SELECT * FROM " . bx_404_table() . " ORDER BY hits DESC, last_seen DESC LIMIT 300", ARRAY_A); ?>
+            <?php $rows = $wpdb->get_results($wpdb->prepare("SELECT * FROM %i ORDER BY hits DESC, last_seen DESC LIMIT 300", bx_404_table()), ARRAY_A); ?>
             <table class="wp-list-table widefat fixed striped">
                 <thead><tr><th>Broken URL</th><th style="width:70px">Hits</th><th>Last referrer</th><th style="width:150px">Last seen</th><th style="width:170px">Actions</th></tr></thead>
                 <tbody>

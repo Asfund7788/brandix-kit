@@ -2,21 +2,36 @@
 /**
  * Plugin Name: Brandix PowerKit - Enterprise Agency Engine
  * Description: All-in-one professional agency utility: URL redirects & 404 log, cookie consent (Consent Mode v2), image optimizer, Sticky action buttons with detached labels, high-performance duplicator, 301 redirection manager with hit tracking, SEO alt tags, maintenance mode, advanced malware security lockdown, global email outcome logging, Google and Microsoft OAuth APIs, SMTP2GO API, Other SMTP, and multiple dynamic search & replace engine.
- * Version: 11.30
+ * Version: 11.31
  * Update URI: https://github.com
- * Requires at least: 5.9
+ * Requires at least: 6.2
  * Requires PHP: 7.4
  * Author: Brandix Soft
  * License: GPLv2 or later
  */
 
 if (!defined('ABSPATH')) exit;
+// phpcs:disable WordPress.DB.DirectDatabaseQuery -- the plugin keeps its logs and redirects in its own custom tables; there is no WordPress API for them and results must be live, so they are queried directly.
+
+/** Raw request URI (unslashed). Used only for URL matching; escaped before output, prepared before SQL. */
+function bx_request_uri() {
+    // phpcs:ignore WordPress.Security.ValidatedSanitizedInput.InputNotSanitized -- exact redirect matching needs the raw URI.
+    return isset($_SERVER['REQUEST_URI']) ? (string) wp_unslash($_SERVER['REQUEST_URI']) : '';
+}
+/** Request method, e.g. GET or POST. */
+function bx_request_method() {
+    return isset($_SERVER['REQUEST_METHOD']) ? strtoupper(sanitize_key(wp_unslash($_SERVER['REQUEST_METHOD']))) : 'GET';
+}
+/** Visitor IP address as reported by the server. */
+function bx_client_ip() {
+    return isset($_SERVER['REMOTE_ADDR']) ? sanitize_text_field(wp_unslash($_SERVER['REMOTE_ADDR'])) : '';
+}
 
 /**
  * 1. Database Initialization & Schema Setup
  * Runs only on activation/version upgrade, not on every frontend request.
  */
-define('BX_POWERKIT_DB_VERSION', '11.30');
+define('BX_POWERKIT_DB_VERSION', '11.31');
 define('BX_POWERKIT_FILE', __FILE__);
 
 // Feature modules (each one checks its own on/off switch).
@@ -230,7 +245,7 @@ function bx_admin_alert_send($user_id, $reason) {
     $message = $reason . ".\n\nUsername: " . $user->user_login
         . "\nEmail: " . $user->user_email
         . "\nPerformed by: " . (($actor && $actor->exists()) ? $actor->user_login : 'System / unknown')
-        . "\nIP: " . sanitize_text_field($_SERVER['REMOTE_ADDR'] ?? '')
+        . "\nIP: " . bx_client_ip()
         . "\nTime: " . current_time('mysql');
     wp_mail(get_option('admin_email'), $subject, $message);
 }
@@ -252,7 +267,7 @@ add_action('add_user_role', function($user_id, $role) {
  * 3. Dynamic Auto-Copyright Year Shortcode
  */
 add_shortcode('bux_current_year', function() {
-    return date('Y');
+    return wp_date('Y');
 });
 
 /**
@@ -303,7 +318,7 @@ add_action('wp_login', function($user_login, $user) {
     if (empty($options['enable_activity_log'])) return;
 
     global $wpdb;
-    $ip = sanitize_text_field($_SERVER['REMOTE_ADDR'] ?? '');
+    $ip = bx_client_ip();
     $country = 'Unknown';
     $city = 'Unknown';
 
@@ -419,6 +434,7 @@ function bx_mail_token_request($provider, $params) {
     $data = json_decode(wp_remote_retrieve_body($response), true);
     if (wp_remote_retrieve_response_code($response) !== 200 || empty($data['access_token'])) {
         $code = is_array($data) && is_string($data['error'] ?? null) ? sanitize_key($data['error']) : 'token_error';
+        // phpcs:ignore WordPress.Security.EscapeOutput.ExceptionNotEscaped -- message is logged, and escaped wherever it is displayed.
         throw new RuntimeException('OAuth authorization failed (' . $code . '). Check app credentials, consent and redirect URI; reconnect if necessary.');
     }
     return $data;
@@ -476,12 +492,12 @@ function bx_mail_access_token($provider, $force = false) {
 function bx_mail_try_lock($lock) {
     global $wpdb;
     $insert = "INSERT IGNORE INTO {$wpdb->options} (option_name, option_value, autoload) VALUES (%s, %s, 'no')";
-    if ($wpdb->query($wpdb->prepare($insert, $lock, (string) time()))) return true;
+    if ($wpdb->query($wpdb->prepare($insert, $lock, (string) time()))) return true; // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared -- $insert is a constant SQL string with placeholders.
     // Clear a stale lock left by a crashed request (older than 60 seconds), then try once more.
     $ts = (int) $wpdb->get_var($wpdb->prepare("SELECT option_value FROM {$wpdb->options} WHERE option_name = %s", $lock));
     if ($ts && $ts < time() - 60) {
         $wpdb->query($wpdb->prepare("DELETE FROM {$wpdb->options} WHERE option_name = %s AND option_value = %s", $lock, (string) $ts));
-        return (bool) $wpdb->query($wpdb->prepare($insert, $lock, (string) time()));
+        return (bool) $wpdb->query($wpdb->prepare($insert, $lock, (string) time())); // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared -- $insert is a constant SQL string with placeholders.
     }
     return false;
 }
@@ -514,20 +530,21 @@ add_action('admin_post_bx_mail_connect', function() {
         'scope'=>$c['scope'], 'state'=>$state, 'code_challenge'=>bx_mail_b64url(hash('sha256', $verifier, true)), 'code_challenge_method'=>'S256'];
     if ($provider === 'google') { $params['access_type']='offline'; $params['prompt']='consent'; }
     else { $params['response_mode']='query'; $params['prompt']='select_account'; }
+    // phpcs:ignore WordPress.Security.SafeRedirect.wp_redirect_wp_redirect -- sends the admin to the OAuth provider (external host).
     wp_redirect($c['authorize'] . '?' . http_build_query($params, '', '&', PHP_QUERY_RFC3986));
     exit;
 });
 add_action('admin_post_bx_mail_oauth_callback', function() {
     if (!current_user_can('manage_options')) wp_die('Sign in as the administrator who started the connection.');
-    $state = sanitize_text_field(wp_unslash($_GET['state'] ?? ''));
+    $state = sanitize_text_field(wp_unslash($_GET['state'] ?? '')); // phpcs:ignore WordPress.Security.NonceVerification.Recommended -- OAuth callback, protected by the single-use state token.
     if (!preg_match('/^[a-f0-9]{64}$/D', $state)) wp_die('Invalid OAuth state.');
     $key = 'bx_mail_state_' . hash('sha256', $state);
     $saved = get_transient($key);
     if (!$saved || $saved['user'] !== get_current_user_id() || !hash_equals($saved['session'], hash('sha256', wp_get_session_token()))) wp_die('Connection expired or session changed. Start again from Brandix Kit.');
     delete_transient($key);
     if (!hash_equals($saved['fingerprint'], bx_mail_fingerprint($saved['provider']))) wp_die('Credentials changed during authorization. Start again.');
-    if (!empty($_GET['error'])) wp_die('Provider authorization was declined or failed. Start again from Brandix Kit.');
-    $code = sanitize_text_field(wp_unslash($_GET['code'] ?? ''));
+    if (!empty($_GET['error'])) wp_die('Provider authorization was declined or failed. Start again from Brandix Kit.'); // phpcs:ignore WordPress.Security.NonceVerification.Recommended -- OAuth callback, protected by the single-use state token.
+    $code = sanitize_text_field(wp_unslash($_GET['code'] ?? '')); // phpcs:ignore WordPress.Security.NonceVerification.Recommended -- OAuth callback, protected by the single-use state token.
     if (!$code) wp_die('Missing authorization code.');
     try {
         $data = bx_mail_token_request($saved['provider'], ['grant_type'=>'authorization_code', 'code'=>$code, 'redirect_uri'=>bx_mail_callback_uri(), 'code_verifier'=>$saved['verifier']]);
@@ -561,6 +578,7 @@ add_filter('pre_wp_mail', function($short_circuit, $atts) {
         class BX_Provider_PHPMailer extends \PHPMailer\PHPMailer\PHPMailer {
             public $bx_config_error = '';
             public function preSend() {
+                // phpcs:ignore WordPress.Security.EscapeOutput.ExceptionNotEscaped -- internal PHPMailer error, escaped when displayed.
                 if ($this->bx_config_error !== '') throw new \PHPMailer\PHPMailer\Exception($this->bx_config_error);
                 return parent::preSend();
             }
@@ -569,6 +587,7 @@ add_filter('pre_wp_mail', function($short_circuit, $atts) {
                     if (bx_mail_provider() === 'smtp') return parent::postSend();
                     return bx_mail_send_mime($this->getSentMIMEMessage());
                 }
+                // phpcs:ignore WordPress.Security.EscapeOutput.ExceptionNotEscaped -- internal PHPMailer error, escaped when displayed.
                 catch (Throwable $e) { throw new \PHPMailer\PHPMailer\Exception($e->getMessage()); }
             }
         }
@@ -641,6 +660,7 @@ function bx_mail_send_mime($mime) {
     if (!$ok) {
         $code = $data['error']['code'] ?? $data['data']['error_code'] ?? '';
         $code = is_scalar($code) ? sanitize_text_field((string)$code) : '';
+        // phpcs:ignore WordPress.Security.EscapeOutput.ExceptionNotEscaped -- message is logged, and escaped wherever it is displayed.
         throw new RuntimeException(ucfirst($provider) . ' rejected or did not confirm the message (HTTP ' . $status . ($code ? ', ' . $code : '') . '). Check credentials, account permissions, verified sender and provider limits.');
     }
     return true;
@@ -677,11 +697,9 @@ add_action('template_redirect', function() {
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
         <title>Under Maintenance | <?php echo esc_html($site_name); ?></title>
-        <link rel="preconnect" href="https://fonts.googleapis.com">
-        <link href="https://fonts.googleapis.com/css2?family=Montserrat:wght@400;600;800&display=swap" rel="stylesheet">
         <style>
             * { margin: 0; padding: 0; box-sizing: border-box; }
-            body { background: #0b0f19; color: #ffffff; font-family: 'Montserrat', sans-serif; min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 24px; text-align: center; }
+            body { background: #0b0f19; color: #ffffff; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 24px; text-align: center; }
             .container { max-width: 600px; }
             .badge { display: inline-flex; align-items: center; gap: 8px; background: rgba(0,116,253,0.12); border: 1px solid rgba(0,116,253,0.35); color: #38bdf8; font-size: 12px; font-weight: 700; letter-spacing: 1.5px; text-transform: uppercase; padding: 8px 18px; border-radius: 30px; margin-bottom: 24px; }
             h1 { font-size: 38px; font-weight: 800; line-height: 1.2; margin-bottom: 16px; }
@@ -694,7 +712,7 @@ add_action('template_redirect', function() {
             <div class="badge">Scheduled Maintenance</div>
             <h1>Website Under <span>Construction</span></h1>
             <p>We are currently upgrading our platform for better performance and will be back shortly.</p>
-            <div style="font-size:13px; color:#64748b;">&copy; <?php echo date('Y'); ?> <?php echo esc_html($site_name); ?>. All rights reserved.</div>
+            <div style="font-size:13px; color:#64748b;">&copy; <?php echo esc_html(wp_date('Y')); ?> <?php echo esc_html($site_name); ?>. All rights reserved.</div>
         </div>
     </body>
     </html>
@@ -712,14 +730,14 @@ add_action('init', function() {
     add_action('template_redirect', function() {
         if (is_admin() || is_front_page() || is_home()) return;
         // Never 301 a form POST — browsers would drop the submitted data.
-        $method = strtoupper($_SERVER['REQUEST_METHOD'] ?? 'GET');
+        $method = bx_request_method();
         if (!in_array($method, ['GET', 'HEAD'], true)) return;
 
-        $request_uri = $_SERVER['REQUEST_URI'] ?? '';
-        $path = parse_url($request_uri, PHP_URL_PATH);
-        $query = parse_url($request_uri, PHP_URL_QUERY);
+        $request_uri = bx_request_uri();
+        $path = wp_parse_url($request_uri, PHP_URL_PATH);
+        $query = wp_parse_url($request_uri, PHP_URL_QUERY);
 
-        $home_path = parse_url(home_url(), PHP_URL_PATH) ?: '';
+        $home_path = wp_parse_url(home_url(), PHP_URL_PATH) ?: '';
         $trimmed_home = untrailingslashit($home_path);
 
         if ($path !== '/' && $path !== $trimmed_home . '/' && substr($path, -1) === '/') {
@@ -784,9 +802,9 @@ add_action('template_redirect', function() {
         $target_post_id = get_queried_object_id();
     } elseif (is_404()) {
         // Only look up by slug on 404s, so real archives (e.g. /category/services) are never hijacked.
-        $request_uri = $_SERVER['REQUEST_URI'] ?? '';
-        $path = trim(parse_url($request_uri, PHP_URL_PATH), '/');
-        $home_path = trim(parse_url(home_url(), PHP_URL_PATH) ?: '', '/');
+        $request_uri = bx_request_uri();
+        $path = trim(wp_parse_url($request_uri, PHP_URL_PATH), '/');
+        $home_path = trim(wp_parse_url(home_url(), PHP_URL_PATH) ?: '', '/');
         if (!empty($home_path) && strpos($path, $home_path) === 0) {
             $path = trim(substr($path, strlen($home_path)), '/');
         }
@@ -818,7 +836,7 @@ add_action('template_redirect', function() {
             $hits = (int) get_post_meta($target_post_id, '_bx_redirect_hits', true);
             update_post_meta($target_post_id, '_bx_redirect_hits', $hits + 1);
 
-            wp_redirect(esc_url_raw($target_url), 301, 'Brandix PowerKit');
+            wp_redirect(esc_url_raw($target_url), 301, 'Brandix PowerKit'); // phpcs:ignore WordPress.Security.SafeRedirect.wp_redirect_wp_redirect -- admin-defined target may be on another domain.
             exit;
         }
     }
@@ -847,8 +865,8 @@ add_filter('elementor_pro/forms/validation/tel', function($field, $record, $ajax
     if ($clean_value === '') return;
 
     if (strlen($clean_value) < $region['min_digits']) {
-        $error_msg = ($region['country_code'] === 'gb') ? 'Please enter a valid UK phone number.' : 'Please enter a valid US phone number.';
-        $ajax_handler->add_error($field['id'], __($error_msg, 'brandixsoft-domain'));
+        $error_msg = ($region['country_code'] === 'gb') ? __('Please enter a valid UK phone number.', 'brandix-sticky') : __('Please enter a valid US phone number.', 'brandix-sticky');
+        $ajax_handler->add_error($field['id'], $error_msg);
     }
 }, 10, 3);
 
@@ -861,7 +879,7 @@ add_action('wp_footer', function() {
     ?>
     <script>
     (function() {
-        var CDN = "https://cdnjs.cloudflare.com/ajax/libs/intl-tel-input/17.0.8/";
+        var CDN = "<?php echo esc_js(plugins_url('assets/intl-tel-input/', BX_POWERKIT_FILE)); ?>";
         var targetCountry = "<?php echo esc_js($region['country_code']); ?>";
         var errorMsg = targetCountry === 'gb' ? "Please enter a valid UK phone number." : "Please enter a valid US phone number.";
 
@@ -895,7 +913,7 @@ add_action('wp_footer', function() {
             });
         }
 
-        // Load the library from the CDN only when the page actually has a phone field.
+        // Load the bundled library only when the page actually has a phone field.
         function boot() {
             if (!document.querySelector("form input[type='tel']")) return;
             if (window.intlTelInput) { initInputs(); return; }
@@ -903,7 +921,7 @@ add_action('wp_footer', function() {
             boot.loading = true;
             var css = document.createElement('link');
             css.rel = 'stylesheet';
-            css.href = CDN + 'css/intlTelInput.css';
+            css.href = CDN + 'css/intlTelInput.min.css';
             document.head.appendChild(css);
             var js = document.createElement('script');
             js.src = CDN + 'js/intlTelInput.min.js';
@@ -1627,8 +1645,8 @@ function sb_admin_dashboard_page() {
                                 foreach ($rules as $i => $rule) {
                                     ?>
                                     <div class="sb-replace-row" style="display: flex; gap: 10px; margin-bottom: 10px; align-items: center;">
-                                        <input type="text" name="sb_options[replace_rules][<?php echo $i; ?>][search]" class="bx-input" style="flex:1;" value="<?php echo esc_attr($rule['search'] ?? ''); ?>" placeholder="Search Text / Link (e.g. 01202 080 151)">
-                                        <input type="text" name="sb_options[replace_rules][<?php echo $i; ?>][replace]" class="bx-input" style="flex:1;" value="<?php echo esc_attr($rule['replace'] ?? ''); ?>" placeholder="Replace With (e.g. 01202 080 152)">
+                                        <input type="text" name="sb_options[replace_rules][<?php echo (int) $i; ?>][search]" class="bx-input" style="flex:1;" value="<?php echo esc_attr($rule['search'] ?? ''); ?>" placeholder="Search Text / Link (e.g. 01202 080 151)">
+                                        <input type="text" name="sb_options[replace_rules][<?php echo (int) $i; ?>][replace]" class="bx-input" style="flex:1;" value="<?php echo esc_attr($rule['replace'] ?? ''); ?>" placeholder="Replace With (e.g. 01202 080 152)">
                                         <button type="button" class="button remove-replace-btn" style="color:#ef4444;">&times;</button>
                                     </div>
                                     <?php
@@ -2247,7 +2265,7 @@ function sb_render_row_html($i, $data, $icons) {
     <div class="sb-btn-box">
         <div class="sb-btn-main">
             <span class="dashicons dashicons-menu sb-drag" title="Drag to reorder"></span>
-            <span class="sb-ico-prev" style="background:<?php echo esc_attr($icon_bg); ?>"><?php echo $preview; ?></span>
+            <span class="sb-ico-prev" style="background:<?php echo esc_attr($icon_bg); ?>"><?php echo $preview; // phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped -- SVG from the plugin icon list or an esc_url() image. ?></span>
             <select name="<?php echo esc_attr($n); ?>[icon]" class="bx-input sb-icon-pick" aria-label="Icon">
                 <?php foreach ($icons as $key => $ic): ?>
                     <option value="<?php echo esc_attr($key); ?>" <?php selected($icon, $key); ?>><?php echo esc_html($ic['name']); ?></option>
@@ -2289,7 +2307,7 @@ add_action('wp_ajax_bx_send_smtp_test_mail', function() {
     check_ajax_referer('bx_test_mail_nonce', 'nonce');
     if (!current_user_can('manage_options')) wp_send_json_error('Access denied');
 
-    $target = sanitize_email($_POST['test_email'] ?? '');
+    $target = sanitize_email(wp_unslash($_POST['test_email'] ?? ''));
     if (!is_email($target)) wp_send_json_error('Invalid email format');
 
     $o = get_option('sb_options', []);
@@ -2361,14 +2379,15 @@ add_action('admin_post_bx_log_delete', function() {
     $table = $map[$log]['table'];
 
     if (!empty($_REQUEST['clear_all'])) {
-        $wpdb->query("TRUNCATE TABLE {$table}");
+        $wpdb->query($wpdb->prepare("TRUNCATE TABLE %i", $table));
         $result = 'all';
     } else {
         $ids = array_values(array_filter(array_map('absint', (array) ($_REQUEST['ids'] ?? []))));
         $result = 0;
         if ($ids) {
             $placeholders = implode(',', array_fill(0, count($ids), '%d'));
-            $result = (int) $wpdb->query($wpdb->prepare("DELETE FROM {$table} WHERE id IN ($placeholders)", $ids));
+            // phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQLPlaceholders.UnfinishedPrepare -- $placeholders is a list of %d.
+            $result = (int) $wpdb->query($wpdb->prepare("DELETE FROM %i WHERE id IN ($placeholders)", array_merge([$table], $ids)));
         }
     }
     wp_safe_redirect(add_query_arg('bx_deleted', $result, admin_url('admin.php?page=' . $map[$log]['page'])));
@@ -2399,8 +2418,9 @@ function bx_log_bulk_button() {
 
 /** Success notice after a delete. */
 function bx_log_deleted_notice() {
+    // phpcs:ignore WordPress.Security.NonceVerification.Recommended -- display-only notice flag.
     if (!isset($_GET['bx_deleted'])) return;
-    $v = sanitize_text_field(wp_unslash($_GET['bx_deleted']));
+    $v = sanitize_text_field(wp_unslash($_GET['bx_deleted'])); // phpcs:ignore WordPress.Security.NonceVerification.Recommended -- display-only notice flag.
     $msg = $v === 'all' ? 'All records cleared.' : sprintf('%d record(s) deleted.', absint($v));
     echo '<div class="notice notice-success is-dismissible"><p>' . esc_html($msg) . '</p></div>';
 }
@@ -2434,12 +2454,12 @@ function bx_admin_email_logs_page() {
     $table = $wpdb->prefix . 'bx_email_logs';
     // Clear action is handled in admin_init (bx_powerkit_handle_admin_actions) before any output.
 
-    $logs = $wpdb->get_results("SELECT * FROM $table ORDER BY sent_at DESC LIMIT 100", ARRAY_A);
+    $logs = $wpdb->get_results($wpdb->prepare("SELECT * FROM %i ORDER BY sent_at DESC LIMIT 100", $table), ARRAY_A);
     ?>
     <div class="wrap">
         <div style="display:flex; justify-content:space-between; align-items:center; margin:15px 0;">
             <h1 style="font-size:22px; font-weight:700; margin:0;">Global Outgoing Email Logs</h1>
-            <a href="<?php echo wp_nonce_url(admin_url('admin.php?page=brandix-email-logs&bx_clear_logs=1'), 'bx_clear_email_logs'); ?>" class="button" onclick="return confirm('Clear all logs?');">Clear All Logs</a>
+            <a href="<?php echo esc_url(wp_nonce_url(admin_url('admin.php?page=brandix-email-logs&bx_clear_logs=1'), 'bx_clear_email_logs')); ?>" class="button" onclick="return confirm('Clear all logs?');">Clear All Logs</a>
         </div>
         <?php bx_log_deleted_notice(); ?>
         <p style="color:#64748b;">Captures all outgoing emails across Elementor, WooCommerce, WPForms, Contact Form 7, and Core WordPress.</p>
@@ -2464,7 +2484,7 @@ function bx_admin_email_logs_page() {
                         // Body was not stored (Store Full Email Content was off when this email was sent).
                         $formatted_message = '<em style="color:#64748b;">Message content was not stored for this email. Turn on <strong>Store Full Email Content</strong> in Brandix Kit &rarr; Auditing to capture message bodies for future emails.</em>';
                     } elseif (is_array($raw_message)) {
-                        $formatted_message = '<pre>' . esc_html(print_r($raw_message, true)) . '</pre>';
+                        $formatted_message = '<pre>' . esc_html(print_r($raw_message, true)) . '</pre>'; // phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_print_r -- shows a stored array message in the admin log viewer.
                     } elseif (preg_match('/<[a-z][^>]*>/i', (string) $raw_message)) {
                         // HTML email: keep safe markup.
                         $formatted_message = wp_kses_post($raw_message);
@@ -2540,8 +2560,8 @@ function bx_admin_activity_page() {
     $login_table = $wpdb->prefix . 'bx_user_activity';
     $audit_table = $wpdb->prefix . 'bx_audit_activity';
 
-    $records = $show_login ? $wpdb->get_results("SELECT * FROM {$login_table} ORDER BY login_time DESC LIMIT 100", ARRAY_A) : [];
-    $audit_records = $show_audit ? $wpdb->get_results("SELECT * FROM {$audit_table} ORDER BY action_time DESC LIMIT 300", ARRAY_A) : [];
+    $records = $show_login ? $wpdb->get_results($wpdb->prepare("SELECT * FROM %i ORDER BY login_time DESC LIMIT 100", $login_table), ARRAY_A) : [];
+    $audit_records = $show_audit ? $wpdb->get_results($wpdb->prepare("SELECT * FROM %i ORDER BY action_time DESC LIMIT 300", $audit_table), ARRAY_A) : [];
     ?>
     <div class="wrap">
         <h1 style="font-size:22px;font-weight:700;margin:15px 0 5px;">User Activity & Audit Log</h1>
@@ -2662,7 +2682,7 @@ function bx_save_audit_activity($args = []) {
         'object_id' => absint($args['object_id']),
         'object_name' => sanitize_text_field($args['object_name']),
         'object_url' => esc_url_raw((string) $args['object_url']),
-        'user_ip' => sanitize_text_field($_SERVER['REMOTE_ADDR'] ?? ''),
+        'user_ip' => bx_client_ip(),
         'action_time' => current_time('mysql')
     ], ['%d','%s','%s','%s','%d','%s','%s','%s','%s']);
 }
@@ -2746,13 +2766,10 @@ function bx_admin_redirections_page() {
     global $wpdb;
     // Remove action is handled in admin_init (bx_powerkit_handle_admin_actions) before any output.
 
-    $posts_table = $wpdb->posts;
-    $meta_table = $wpdb->postmeta;
-    
     $redirections = $wpdb->get_results("
         SELECT p.ID, p.post_title, p.post_type, p.post_status, pm.meta_value as target_url 
-        FROM {$posts_table} p 
-        JOIN {$meta_table} pm ON p.ID = pm.post_id 
+        FROM {$wpdb->posts} p 
+        JOIN {$wpdb->postmeta} pm ON p.ID = pm.post_id 
         WHERE pm.meta_key = '_bx_redirect_url' AND pm.meta_value != ''
     ", ARRAY_A);
     ?>
@@ -2785,7 +2802,7 @@ function bx_admin_redirections_page() {
                         <td><a href="<?php echo esc_url($redir['target_url']); ?>" target="_blank" style="color:#0074FD;"><?php echo esc_html($redir['target_url']); ?></a></td>
                         <td style="text-align:center;"><span style="background:#dcfce7; color:#166534; padding:3px 10px; border-radius:12px; font-weight:700; font-size:12px;"><?php echo esc_html($hits); ?></span></td>
                         <td style="text-align:center;">
-                            <a href="<?php echo wp_nonce_url(admin_url('admin.php?page=brandix-redirections&bx_remove_redirection=' . $redir['ID']), 'bx_remove_redir_' . $redir['ID']); ?>" class="button button-small" style="color:#ef4444;" onclick="return confirm('Remove redirection for this page?');">Remove</a>
+                            <a href="<?php echo esc_url(wp_nonce_url(admin_url('admin.php?page=brandix-redirections&bx_remove_redirection=' . (int) $redir['ID']), 'bx_remove_redir_' . (int) $redir['ID'])); ?>" class="button button-small" style="color:#ef4444;" onclick="return confirm('Remove redirection for this page?');">Remove</a>
                         </td>
                     </tr>
                 <?php endforeach; else: ?>
@@ -2880,25 +2897,25 @@ add_action('wp_footer', function() {
     $close_svg = '<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>';
     ?>
     <style>
-        #bx-sticky{position:fixed;<?php echo $vcss; ?><?php echo $side; ?>:<?php echo (int) $s['offset_side']; ?>px;z-index:99999;display:flex;flex-direction:<?php echo $wrap_dir; ?>;align-items:<?php echo $wrap_align; ?>;gap:14px;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif}
-        #bx-sticky .bx-items{display:flex;flex-direction:<?php echo $items_dir; ?>;gap:12px;align-items:<?php echo $items_align; ?>;padding-<?php echo $side; ?>:<?php echo $items_pad; ?>px}
-        #bx-sticky .bx-btn-unit{display:inline-flex;align-items:center;flex-direction:<?php echo $is_left ? 'row' : 'row-reverse'; ?>;gap:10px;text-decoration:none!important;transition:transform .25s ease}
+        #bx-sticky{position:fixed;<?php echo esc_attr($vcss); ?><?php echo esc_attr($side); ?>:<?php echo (int) $s['offset_side']; ?>px;z-index:99999;display:flex;flex-direction:<?php echo esc_attr($wrap_dir); ?>;align-items:<?php echo esc_attr($wrap_align); ?>;gap:14px;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif}
+        #bx-sticky .bx-items{display:flex;flex-direction:<?php echo esc_attr($items_dir); ?>;gap:12px;align-items:<?php echo esc_attr($items_align); ?>;padding-<?php echo esc_attr($side); ?>:<?php echo esc_attr($items_pad); ?>px}
+        #bx-sticky .bx-btn-unit{display:inline-flex;align-items:center;flex-direction:<?php echo esc_attr($is_left ? 'row' : 'row-reverse'); ?>;gap:10px;text-decoration:none!important;transition:transform .25s ease}
         #bx-sticky .bx-btn-unit:hover{transform:translateY(-2px)}
-        #bx-sticky .bx-icon-circle{width:<?php echo $size; ?>px;height:<?php echo $size; ?>px;border-radius:<?php echo $btn_radius; ?>;<?php echo $s['btn_shape'] === 'hexagon' ? 'clip-path:polygon(25% 6%,75% 6%,100% 50%,75% 94%,25% 94%,0 50%);' : ''; ?>display:flex;align-items:center;justify-content:center;color:#fff;box-shadow:0 4px 14px rgba(0,0,0,.25);flex-shrink:0;transition:transform .2s ease}
+        #bx-sticky .bx-icon-circle{width:<?php echo esc_attr($size); ?>px;height:<?php echo esc_attr($size); ?>px;border-radius:<?php echo esc_attr($btn_radius); ?>;<?php echo $s['btn_shape'] === 'hexagon' ? 'clip-path:polygon(25% 6%,75% 6%,100% 50%,75% 94%,25% 94%,0 50%);' : ''; ?>display:flex;align-items:center;justify-content:center;color:#fff;box-shadow:0 4px 14px rgba(0,0,0,.25);flex-shrink:0;transition:transform .2s ease}
         #bx-sticky .bx-btn-unit:hover .bx-icon-circle{transform:scale(1.06)}
-        #bx-sticky .bx-icon-circle svg{width:<?php echo round($size * 0.52); ?>px;height:<?php echo round($size * 0.52); ?>px}
-        #bx-sticky .bx-pill-label{padding:<?php echo round($label_size * 0.5); ?>px <?php echo round($label_size * 1.15); ?>px;border-radius:12px;color:#fff;font-size:<?php echo $label_size; ?>px;font-weight:600;white-space:nowrap;box-shadow:0 4px 12px rgba(0,0,0,.18);letter-spacing:.2px;line-height:1.25}
+        #bx-sticky .bx-icon-circle svg{width:<?php echo esc_attr(round($size * 0.52)); ?>px;height:<?php echo esc_attr(round($size * 0.52)); ?>px}
+        #bx-sticky .bx-pill-label{padding:<?php echo esc_attr(round($label_size * 0.5)); ?>px <?php echo esc_attr(round($label_size * 1.15)); ?>px;border-radius:12px;color:#fff;font-size:<?php echo esc_attr($label_size); ?>px;font-weight:600;white-space:nowrap;box-shadow:0 4px 12px rgba(0,0,0,.18);letter-spacing:.2px;line-height:1.25}
         <?php if ($card): ?>
-        #bx-sticky .bx-btn-unit{display:flex;flex-direction:row;gap:12px;padding:<?php echo round($label_size * 0.85); ?>px <?php echo round($label_size * 1.6); ?>px <?php echo round($label_size * 0.85); ?>px <?php echo round($label_size * 1.15); ?>px;background:<?php echo esc_attr($s['card_bg']); ?>;border-radius:14px;box-shadow:0 6px 18px rgba(0,0,0,.14)}
-        #bx-sticky .bx-icon-circle{width:<?php echo round($label_size * 1.7); ?>px;height:<?php echo round($label_size * 1.7); ?>px;background:none!important;box-shadow:none;border-radius:0;clip-path:none}
-        #bx-sticky .bx-icon-circle svg{width:<?php echo round($label_size * 1.45); ?>px;height:<?php echo round($label_size * 1.45); ?>px}
-        #bx-sticky .bx-pill-label{background:none!important;box-shadow:none;padding:0;color:<?php echo esc_attr($s['card_text']); ?>;font-size:<?php echo $label_size + 1; ?>px}
+        #bx-sticky .bx-btn-unit{display:flex;flex-direction:row;gap:12px;padding:<?php echo esc_attr(round($label_size * 0.85)); ?>px <?php echo esc_attr(round($label_size * 1.6)); ?>px <?php echo esc_attr(round($label_size * 0.85)); ?>px <?php echo esc_attr(round($label_size * 1.15)); ?>px;background:<?php echo esc_attr($s['card_bg']); ?>;border-radius:14px;box-shadow:0 6px 18px rgba(0,0,0,.14)}
+        #bx-sticky .bx-icon-circle{width:<?php echo esc_attr(round($label_size * 1.7)); ?>px;height:<?php echo esc_attr(round($label_size * 1.7)); ?>px;background:none!important;box-shadow:none;border-radius:0;clip-path:none}
+        #bx-sticky .bx-icon-circle svg{width:<?php echo esc_attr(round($label_size * 1.45)); ?>px;height:<?php echo esc_attr(round($label_size * 1.45)); ?>px}
+        #bx-sticky .bx-pill-label{background:none!important;box-shadow:none;padding:0;color:<?php echo esc_attr($s['card_text']); ?>;font-size:<?php echo esc_attr($label_size + 1); ?>px}
         <?php endif; ?>
         #bx-sticky .bx-cust-ico{display:block;width:100%;height:100%;background:currentColor}
-        #bx-sticky .bx-icon-circle img{width:<?php echo round($size * 0.52); ?>px;height:<?php echo round($size * 0.52); ?>px;object-fit:contain}
+        #bx-sticky .bx-icon-circle img{width:<?php echo esc_attr(round($size * 0.52)); ?>px;height:<?php echo esc_attr(round($size * 0.52)); ?>px;object-fit:contain}
         <?php if ($horiz && !$card): ?>
         #bx-sticky .bx-btn-unit{position:relative}
-        #bx-sticky .bx-pill-label{position:absolute;<?php echo $vpos === 'top' ? 'top' : 'bottom'; ?>:calc(100% + 8px);left:50%;transform:translateX(-50%);opacity:0;visibility:hidden;pointer-events:none;transition:opacity .2s ease}
+        #bx-sticky .bx-pill-label{position:absolute;<?php echo esc_attr($vpos === 'top' ? 'top' : 'bottom'); ?>:calc(100% + 8px);left:50%;transform:translateX(-50%);opacity:0;visibility:hidden;pointer-events:none;transition:opacity .2s ease}
         #bx-sticky .bx-btn-unit:hover .bx-pill-label,#bx-sticky .bx-btn-unit:focus-visible .bx-pill-label{opacity:1;visibility:visible}
         <?php endif; ?>
         @media (min-width:1025px){#bx-sticky .bx-hide-btn-d,#bx-sticky .bx-hide-lbl-d{display:none!important}}
@@ -2907,39 +2924,39 @@ add_action('wp_footer', function() {
 
         <?php if ($toggle): ?>
         /* Collapsed / open states */
-        #bx-sticky.bx-collapsible .bx-btn-unit{transform-origin:<?php echo $side . ' ' . ($vpos === 'top' ? 'top' : 'bottom'); ?>;transition:opacity .2s ease,transform .25s ease,visibility 0s linear .25s}
-        #bx-sticky.bx-collapsible:not(.bx-open) .bx-btn-unit{opacity:0;visibility:hidden;pointer-events:none;transform:<?php echo $from; ?>}
+        #bx-sticky.bx-collapsible .bx-btn-unit{transform-origin:<?php echo esc_attr($side . ' ' . ($vpos === 'top' ? 'top' : 'bottom')); ?>;transition:opacity .2s ease,transform .25s ease,visibility 0s linear .25s}
+        #bx-sticky.bx-collapsible:not(.bx-open) .bx-btn-unit{opacity:0;visibility:hidden;pointer-events:none;transform:<?php echo esc_attr($from); ?>}
         <?php for ($k = 1; $k <= $n; $k++): $delay = $s['stagger'] ? ($k - 1) * 60 : 0; ?>
-        #bx-sticky.bx-open .bx-items > :nth-child(<?php echo $k; ?>){transition:opacity .3s ease <?php echo $delay; ?>ms,transform .45s <?php echo $ease; ?> <?php echo $delay; ?>ms,visibility 0s linear <?php echo $delay; ?>ms}
+        #bx-sticky.bx-open .bx-items > :nth-child(<?php echo esc_attr($k); ?>){transition:opacity .3s ease <?php echo esc_attr($delay); ?>ms,transform .45s <?php echo esc_attr($ease); ?> <?php echo esc_attr($delay); ?>ms,visibility 0s linear <?php echo esc_attr($delay); ?>ms}
         <?php endfor; ?>
 
         /* Launcher */
-        #bx-sticky .bx-launcher{position:relative;width:<?php echo $L; ?>px;height:<?php echo $L; ?>px;margin:0 <?php echo $is_left ? '0 0 ' . $launch_margin . 'px' : $launch_margin . 'px 0 0'; ?>;padding:0;border:0;background:none;cursor:pointer;color:<?php echo esc_attr($lc); ?>;display:flex;align-items:center;justify-content:center;filter:drop-shadow(0 6px 14px rgba(0,0,0,.28));transition:transform .25s ease;-webkit-tap-highlight-color:transparent;font:inherit;line-height:1}
+        #bx-sticky .bx-launcher{position:relative;width:<?php echo esc_attr($L); ?>px;height:<?php echo esc_attr($L); ?>px;margin:0 <?php echo esc_attr($is_left ? '0 0 ' . $launch_margin . 'px' : $launch_margin . 'px 0 0'); ?>;padding:0;border:0;background:none;cursor:pointer;color:<?php echo esc_attr($lc); ?>;display:flex;align-items:center;justify-content:center;filter:drop-shadow(0 6px 14px rgba(0,0,0,.28));transition:transform .25s ease;-webkit-tap-highlight-color:transparent;font:inherit;line-height:1}
         #bx-sticky .bx-launcher:hover{transform:scale(1.06)}
         #bx-sticky .bx-launcher:focus-visible{outline:2px solid <?php echo esc_attr($lb); ?>;outline-offset:5px}
         #bx-sticky .bx-l-in{position:relative;display:flex;align-items:center;justify-content:center;gap:10px;width:100%;height:100%}
-        #bx-sticky .bx-l-bg,#bx-sticky .bx-l-pulse{position:absolute;top:0;right:0;bottom:0;left:0;background:<?php echo esc_attr($lb); ?>;<?php echo $shape_css; ?>}
+        #bx-sticky .bx-l-bg,#bx-sticky .bx-l-pulse{position:absolute;top:0;right:0;bottom:0;left:0;background:<?php echo esc_attr($lb); ?>;<?php echo esc_attr($shape_css); ?>}
         #bx-sticky .bx-l-pulse{opacity:0}
-        #bx-sticky .bx-l-icons{position:relative;z-index:1;width:<?php echo $ico; ?>px;height:<?php echo $ico; ?>px;flex-shrink:0}
+        #bx-sticky .bx-l-icons{position:relative;z-index:1;width:<?php echo esc_attr($ico); ?>px;height:<?php echo esc_attr($ico); ?>px;flex-shrink:0}
         #bx-sticky .bx-l-ico{position:absolute;top:0;left:0;width:100%;height:100%;display:flex;transition:transform .35s ease,opacity .25s ease}
         #bx-sticky .bx-l-ico svg{width:100%;height:100%}
         #bx-sticky .bx-l-close{opacity:0;transform:rotate(-90deg) scale(.5)}
         #bx-sticky.bx-open .bx-l-open{opacity:0;transform:rotate(90deg) scale(.5)}
         #bx-sticky.bx-open .bx-l-close{opacity:1;transform:none}
-        #bx-sticky .bx-l-text{position:relative;z-index:1;font-size:<?php echo $label_size + 1; ?>px;font-weight:600;white-space:nowrap}
+        #bx-sticky .bx-l-text{position:relative;z-index:1;font-size:<?php echo esc_attr($label_size + 1); ?>px;font-weight:600;white-space:nowrap}
         <?php if ($shape === 'pill'): ?>
         #bx-sticky .bx-launcher{width:auto}
-        #bx-sticky .bx-l-in{width:auto;padding:0 <?php echo round($L * 0.45); ?>px 0 <?php echo round($L * 0.34); ?>px}
+        #bx-sticky .bx-l-in{width:auto;padding:0 <?php echo esc_attr(round($L * 0.45)); ?>px 0 <?php echo esc_attr(round($L * 0.34)); ?>px}
         <?php endif; ?>
-        #bx-sticky .bx-l-badge{position:absolute;top:-4px;<?php echo $is_left ? 'right' : 'left'; ?>:-4px;z-index:2;min-width:20px;height:20px;padding:0 6px;box-sizing:border-box;border-radius:10px;background:#ef4444;color:#fff;font-size:11px;font-weight:700;line-height:20px;text-align:center;box-shadow:0 0 0 2px #fff}
+        #bx-sticky .bx-l-badge{position:absolute;top:-4px;<?php echo esc_attr($is_left ? 'right' : 'left'); ?>:-4px;z-index:2;min-width:20px;height:20px;padding:0 6px;box-sizing:border-box;border-radius:10px;background:#ef4444;color:#fff;font-size:11px;font-weight:700;line-height:20px;text-align:center;box-shadow:0 0 0 2px #fff}
         #bx-sticky.bx-open .bx-l-badge,#bx-sticky.bx-seen .bx-l-badge{display:none}
 
         /* Attention effects (only while closed) */
-        @keyframes bx-ring{0%{transform:<?php echo $base_tf; ?>scale(1);opacity:.55}100%{transform:<?php echo $base_tf; ?>scale(1.6);opacity:0}}
+        @keyframes bx-ring{0%{transform:<?php echo esc_attr($base_tf); ?>scale(1);opacity:.55}100%{transform:<?php echo esc_attr($base_tf); ?>scale(1.6);opacity:0}}
         @keyframes bx-bounce{0%,20%,50%,80%,100%{transform:translateY(0)}40%{transform:translateY(-10px)}60%{transform:translateY(-5px)}}
         @keyframes bx-wiggle{0%,70%,100%{transform:rotate(0)}75%{transform:rotate(-12deg)}80%{transform:rotate(10deg)}85%{transform:rotate(-8deg)}90%{transform:rotate(6deg)}95%{transform:rotate(-3deg)}}
         @keyframes bx-heart{0%,42%,100%{transform:scale(1)}14%,35%{transform:scale(1.12)}28%{transform:scale(1)}}
-        @keyframes bx-glow{0%{box-shadow:0 0 0 0 <?php echo bx_hex_rgba($lb, .6); ?>}100%{box-shadow:0 0 0 16px <?php echo bx_hex_rgba($lb, 0); ?>}}
+        @keyframes bx-glow{0%{box-shadow:0 0 0 0 <?php echo esc_attr(bx_hex_rgba($lb, .6)); ?>}100%{box-shadow:0 0 0 16px <?php echo esc_attr(bx_hex_rgba($lb, 0)); ?>}}
         @keyframes bx-blob{0%{border-radius:42% 58% 55% 45% / 48% 42% 58% 52%}50%{border-radius:58% 42% 45% 55% / 55% 58% 42% 45%}100%{border-radius:48% 52% 62% 38% / 40% 52% 48% 60%}}
         <?php
         $att = [
@@ -2949,11 +2966,11 @@ add_action('wp_footer', function() {
             'heartbeat' => '#bx-sticky:not(.bx-open) .bx-l-in{animation:bx-heart 2s ease infinite}',
             'glow'      => '#bx-sticky:not(.bx-open) .bx-l-bg{animation:bx-glow 1.8s ease-out infinite' . ($shape === 'blob' ? ',bx-blob 7s ease-in-out infinite alternate' : '') . '}',
         ];
-        echo $att[$s['attention']] ?? '';
+        echo esc_html($att[$s['attention']] ?? '');
         ?>
 
         /* Greeting bubble */
-        #bx-sticky .bx-greet{position:absolute;<?php echo $vpos === 'top' ? 'top' : 'bottom'; ?>:<?php echo round($L * 0.12); ?>px;<?php echo $side; ?>:<?php echo $L + $launch_margin + 14; ?>px;width:max-content;max-width:min(250px,calc(100vw - <?php echo $L + (int) $s['offset_side'] + 40; ?>px));padding:12px 34px 12px 14px;background:#fff;color:#1e293b;font-size:14px;line-height:1.45;border-radius:12px;box-shadow:0 8px 24px rgba(0,0,0,.16);cursor:pointer;opacity:0;visibility:hidden;transform:translateX(<?php echo $is_left ? '-' : ''; ?>10px);transition:opacity .3s ease,transform .3s ease,visibility 0s linear .3s}
+        #bx-sticky .bx-greet{position:absolute;<?php echo esc_attr($vpos === 'top' ? 'top' : 'bottom'); ?>:<?php echo esc_attr(round($L * 0.12)); ?>px;<?php echo esc_attr($side); ?>:<?php echo esc_attr($L + $launch_margin + 14); ?>px;width:max-content;max-width:min(250px,calc(100vw - <?php echo esc_attr($L + (int) $s['offset_side'] + 40); ?>px));padding:12px 34px 12px 14px;background:#fff;color:#1e293b;font-size:14px;line-height:1.45;border-radius:12px;box-shadow:0 8px 24px rgba(0,0,0,.16);cursor:pointer;opacity:0;visibility:hidden;transform:translateX(<?php echo esc_attr($is_left ? '-' : ''); ?>10px);transition:opacity .3s ease,transform .3s ease,visibility 0s linear .3s}
         #bx-sticky .bx-greet.bx-show{opacity:1;visibility:visible;transform:none;transition:opacity .3s ease,transform .3s ease}
         #bx-sticky .bx-greet-x{position:absolute;top:4px;right:6px;width:24px;height:24px;padding:0;border:0;background:none;color:#94a3b8;font-size:18px;line-height:24px;cursor:pointer}
 
@@ -2963,10 +2980,10 @@ add_action('wp_footer', function() {
 
         <?php foreach ($mq as $dev => $query): if (in_array($dev, $collapse_on, true)) continue; ?>
         /* Not collapsed on this device: plain always-visible buttons */
-        @media <?php echo $query; ?>{
+        @media <?php echo esc_attr($query); ?>{
             #bx-sticky .bx-launcher,#bx-sticky .bx-greet,#bx-sticky .bx-overlay{display:none!important}
             #bx-sticky.bx-collapsible .bx-btn-unit{opacity:1!important;visibility:visible!important;transform:none!important;pointer-events:auto!important}
-            #bx-sticky .bx-items{padding-<?php echo $side; ?>:0}
+            #bx-sticky .bx-items{padding-<?php echo esc_attr($side); ?>:0}
         }
         <?php endforeach; ?>
         @media (prefers-reduced-motion:reduce){#bx-sticky *{animation:none!important;transition-duration:.01ms!important;transition-delay:0s!important}}
@@ -2978,7 +2995,7 @@ add_action('wp_footer', function() {
                 <span class="bx-l-in">
                     <span class="bx-l-pulse" aria-hidden="true"></span>
                     <span class="bx-l-bg" aria-hidden="true"></span>
-                    <span class="bx-l-icons"><span class="bx-l-ico bx-l-open"><?php echo $open_svg; ?></span><span class="bx-l-ico bx-l-close"><?php echo $close_svg; ?></span></span>
+                    <span class="bx-l-icons"><span class="bx-l-ico bx-l-open"><?php echo $open_svg; // phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped -- fixed SVG from the plugin. ?></span><span class="bx-l-ico bx-l-close"><?php echo $close_svg; // phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped -- fixed SVG from the plugin. ?></span></span>
                     <?php if ($shape === 'pill' && $s['launcher_text'] !== ''): ?><span class="bx-l-text"><?php echo esc_html($s['launcher_text']); ?></span><?php endif; ?>
                 </span>
                 <?php if ($s['badge_text'] !== ''): ?><span class="bx-l-badge"><?php echo esc_html($s['badge_text']); ?></span><?php endif; ?>
@@ -3018,7 +3035,7 @@ add_action('wp_footer', function() {
             }
         ?>
             <a href="<?php echo esc_url($btn['link']); ?>" class="<?php echo esc_attr(implode(' ', $btn_classes)); ?>"<?php echo $is_web ? ' target="_blank" rel="noopener noreferrer"' : ''; ?> aria-label="<?php echo esc_attr($btn['label'] ?: ($icons[$icon_key]['name'] ?? 'Contact')); ?>">
-                <span class="bx-icon-circle" style="<?php echo esc_attr($icon_style); ?>"><?php echo $svg; ?></span>
+                <span class="bx-icon-circle" style="<?php echo esc_attr($icon_style); ?>"><?php echo $svg; // phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped -- SVG from the plugin icon list or an esc_url() image. ?></span>
                 <?php if (!empty($btn['label'])): ?>
                     <span class="<?php echo esc_attr(implode(' ', $lbl_classes)); ?>"<?php echo $card ? '' : ' style="background:' . esc_attr($label_bg) . ';"'; ?>><?php echo esc_html($btn['label']); ?></span>
                 <?php endif; ?>
@@ -3095,7 +3112,7 @@ function bx_duplicator_row_hook($actions, $post) {
 add_action('admin_action_sb_duplicate', function() {
     // Respect the module switch even if someone calls the URL directly.
     if (empty(get_option('sb_options', [])['enable_duplicator'])) wp_die('The duplicator module is disabled in Brandix Kit.');
-    $post_id = isset($_GET['post']) ? absint($_GET['post']) : 0;
+    $post_id = isset($_GET['post']) ? absint($_GET['post']) : 0; // phpcs:ignore WordPress.Security.NonceVerification.Recommended -- nonce is checked right below with this ID.
     if (!$post_id) wp_die('Invalid item.');
     check_admin_referer('sb_dup_' . $post_id);
 
@@ -3244,7 +3261,7 @@ add_action('admin_footer', function() {
                 action: 'bx_save_row_redirect',
                 post_id: post_id,
                 redirect_url: new_url,
-                nonce: '<?php echo wp_create_nonce("bx_save_redirect_nonce"); ?>'
+                nonce: '<?php echo esc_js(wp_create_nonce('bx_save_redirect_nonce')); ?>'
             }, function(response) {
                 if (response.success) {
                     if (response.data.url) {
@@ -3290,7 +3307,8 @@ add_action('wp_ajax_bx_save_row_redirect', function() {
     $post_id = isset($_POST['post_id']) ? absint($_POST['post_id']) : 0;
     if (!$post_id || !current_user_can('edit_post', $post_id)) wp_send_json_error();
 
-    $result = bx_validate_redirect_target($_POST['redirect_url'] ?? '', $post_id);
+    // phpcs:ignore WordPress.Security.ValidatedSanitizedInput.InputNotSanitized -- validated and sanitised in bx_validate_redirect_target().
+    $result = bx_validate_redirect_target(wp_unslash($_POST['redirect_url'] ?? ''), $post_id);
     if (is_wp_error($result)) wp_send_json_error(['message' => $result->get_error_message()]);
     if ($result !== '') {
         update_post_meta($post_id, '_bx_redirect_url', $result);
@@ -3316,12 +3334,13 @@ add_action('add_meta_boxes', function() {
 });
 
 add_action('save_post', function($post_id) {
-    if (!isset($_POST['bx_redirect_nonce']) || !wp_verify_nonce($_POST['bx_redirect_nonce'], 'bx_meta_redirect_save')) return;
+    if (!isset($_POST['bx_redirect_nonce']) || !wp_verify_nonce(sanitize_text_field(wp_unslash($_POST['bx_redirect_nonce'])), 'bx_meta_redirect_save')) return;
     if (defined('DOING_AUTOSAVE') && DOING_AUTOSAVE) return;
     if (!current_user_can('edit_post', $post_id)) return;
 
     if (isset($_POST['bx_redirect_target_url'])) {
-        $result = bx_validate_redirect_target($_POST['bx_redirect_target_url'], $post_id);
+        // phpcs:ignore WordPress.Security.ValidatedSanitizedInput.InputNotSanitized -- validated and sanitised in bx_validate_redirect_target().
+        $result = bx_validate_redirect_target(wp_unslash($_POST['bx_redirect_target_url']), $post_id);
         if (is_wp_error($result)) {
             add_filter('redirect_post_location', function($location) use ($result) {
                 return add_query_arg('bx_redirect_error', rawurlencode($result->get_error_message()), $location);
@@ -3336,8 +3355,9 @@ add_action('save_post', function($post_id) {
 });
 
 add_action('admin_notices', function() {
+    // phpcs:ignore WordPress.Security.NonceVerification.Recommended -- display-only error message.
     if (!empty($_GET['bx_redirect_error'])) {
-        echo '<div class="notice notice-error is-dismissible"><p>' . esc_html(wp_unslash($_GET['bx_redirect_error'])) . '</p></div>';
+        echo '<div class="notice notice-error is-dismissible"><p>' . esc_html(sanitize_text_field(wp_unslash($_GET['bx_redirect_error']))) . '</p></div>'; // phpcs:ignore WordPress.Security.NonceVerification.Recommended -- display-only error message.
     }
 });
 
@@ -3346,7 +3366,7 @@ function bx_powerkit_cleanup_logs() {
     global $wpdb;
     $o = get_option('sb_options', []);
     $days = in_array((int)($o['log_retention_days'] ?? 90), [30,60,90], true) ? (int)$o['log_retention_days'] : 90;
-    $cutoff = date('Y-m-d H:i:s', current_time('timestamp') - ($days * DAY_IN_SECONDS));
+    $cutoff = gmdate('Y-m-d H:i:s', current_time('timestamp') - ($days * DAY_IN_SECONDS));
     $wpdb->query($wpdb->prepare("DELETE FROM {$wpdb->prefix}bx_email_logs WHERE sent_at < %s", $cutoff));
     $wpdb->query($wpdb->prepare("DELETE FROM {$wpdb->prefix}bx_user_activity WHERE login_time < %s", $cutoff));
     $wpdb->query($wpdb->prepare("DELETE FROM {$wpdb->prefix}bx_audit_activity WHERE action_time < %s", $cutoff));
@@ -3357,7 +3377,7 @@ function bx_powerkit_cleanup_logs() {
     if ($keep_from) $wpdb->query($wpdb->prepare("DELETE FROM {$wpdb->prefix}bx_404_log WHERE last_seen <= %s", $keep_from));
 
     // Consent records are proof of consent, so they are kept for at least a year.
-    $consent_cutoff = date('Y-m-d H:i:s', current_time('timestamp') - (max($days, 365) * DAY_IN_SECONDS));
+    $consent_cutoff = gmdate('Y-m-d H:i:s', current_time('timestamp') - (max($days, 365) * DAY_IN_SECONDS));
     $wpdb->query($wpdb->prepare("DELETE FROM {$wpdb->prefix}bx_consent_log WHERE created_at < %s", $consent_cutoff));
 }
 add_action('bx_powerkit_daily_cleanup', 'bx_powerkit_cleanup_logs');
