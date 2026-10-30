@@ -2132,9 +2132,9 @@ function sb_admin_dashboard_page() {
                     <div class="bx-grid-field">
                         <div>
                             <div class="bx-label-title">GitHub repository</div>
-                            <div class="bx-label-desc">Default: <code>Asfund7788/brandix-kit</code>. Leave empty to use it, or enter another <code>owner/repo</code>. New releases there show up as normal plugin updates on this site.<?php if ($bx_const): ?> <strong>Set in wp-config.php (BX_POWERKIT_REPO).</strong><?php endif; ?></div>
+                            <div class="bx-label-desc">Default: <code>brandixsoft/brandix-kit</code>. Leave empty to use it, or enter another <code>owner/repo</code>. New releases there show up as normal plugin updates on this site.<?php if ($bx_const): ?> <strong>Set in wp-config.php (BX_POWERKIT_REPO).</strong><?php endif; ?></div>
                         </div>
-                        <input type="text" name="sb_options[update_repo]" class="bx-input" style="width:280px" placeholder="Asfund7788/brandix-kit" value="<?php echo esc_attr($bx_const ? BX_POWERKIT_REPO : ($options['update_repo'] ?? '')); ?>" <?php disabled($bx_const); ?>>
+                        <input type="text" name="sb_options[update_repo]" class="bx-input" style="width:280px" placeholder="brandixsoft/brandix-kit" value="<?php echo esc_attr($bx_const ? BX_POWERKIT_REPO : ($options['update_repo'] ?? '')); ?>" <?php disabled($bx_const); ?>>
                     </div>
                     <div class="bx-grid-field">
                         <div>
